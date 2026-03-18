@@ -13,9 +13,18 @@ const app = express();
 
 // ==================== SECURITY MIDDLEWARE ====================
 app.use(helmet());
+
+// CORS configuration - allow both local and live
 app.use(cors({
-    origin: process.env.BASE_URL || '*',
-    credentials: true
+    origin: [
+        'http://localhost:3000',
+        'http://localhost:5000',
+        'https://megatools-dashboard-test.netlify.app',
+        /\.netlify\.app$/
+    ],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 // Rate limiting
@@ -42,7 +51,7 @@ mongoose.connect(process.env.MONGO_URI, {
 
 // ==================== SCHEMAS ====================
 
-// User Schema (complete with all fields)
+// User Schema
 const UserSchema = new mongoose.Schema({
     username: { 
         type: String, 
@@ -124,7 +133,7 @@ const UserSchema = new mongoose.Schema({
     }
 });
 
-// Campaign Schema (with steps array)
+// Campaign Schema
 const CampaignSchema = new mongoose.Schema({
     name: { 
         type: String, 
@@ -186,7 +195,7 @@ const CampaignSchema = new mongoose.Schema({
     }
 });
 
-// Click Schema (for tracking)
+// Click Schema
 const ClickSchema = new mongoose.Schema({
     campaignId: { 
         type: mongoose.Schema.Types.ObjectId, 
@@ -218,7 +227,7 @@ const ClickSchema = new mongoose.Schema({
     metadata: mongoose.Schema.Types.Mixed
 });
 
-// Session Schema (for real-time tracking)
+// Session Schema
 const SessionSchema = new mongoose.Schema({
     traffic_id: { 
         type: String, 
@@ -285,7 +294,7 @@ const SessionSchema = new mongoose.Schema({
     notes: String
 });
 
-// Pre-save middleware for updatedAt
+// Pre-save middleware
 UserSchema.pre('save', function(next) {
     this.updatedAt = Date.now();
     next();
@@ -430,7 +439,6 @@ app.post('/api/auth/register', registerValidation, validateRequest, async (req, 
                 status = 'pending';
             }
         } else {
-            // First user ever? Make them admin (but we already have admin from env)
             status = 'active';
         }
 
@@ -481,7 +489,6 @@ app.post('/api/auth/register', registerValidation, validateRequest, async (req, 
             await session.save();
         }
 
-        // Log registration
         console.log(`✅ New user registered: ${email} as ${targetRole}`);
 
         res.status(201).json({ 
@@ -704,7 +711,6 @@ app.put('/api/users/:id/approve', authMiddleware, roleMiddleware('admin', 'moder
         user.status = 'active';
         await user.save();
 
-        // Create notification or log
         console.log(`✅ User approved: ${user.email} by ${req.user.email}`);
 
         res.json({ 
@@ -779,13 +785,9 @@ app.delete('/api/users/:id', authMiddleware, roleMiddleware('admin', 'moderator'
             return res.status(400).json({ message: 'Cannot delete your own account' });
         }
 
-        // Soft delete or hard delete?
-        // Using soft delete: set status to 'deleted'
+        // Soft delete
         user.status = 'deleted';
         await user.save();
-        
-        // Or hard delete:
-        // await user.deleteOne();
 
         console.log(`🗑️ User deleted: ${user.email} by ${req.user.email}`);
 
@@ -878,27 +880,42 @@ app.put('/api/users/password', authMiddleware, async (req, res) => {
     }
 });
 
-// Get referral link
+// ==================== REFERRAL ROUTES (UPDATED) ====================
+
+// Get referral link with dynamic base URL based on request origin
 app.get('/api/users/referral/link', authMiddleware, async (req, res) => {
     try {
-        // Different roles can invite different roles
-        let inviteRoles = [];
-        if (req.user.role === 'admin') {
-            inviteRoles = ['moderator'];
-        } else if (req.user.role === 'moderator') {
-            inviteRoles = ['user'];
-        } else {
-            inviteRoles = [];
+        // Get the origin/referer from request headers
+        const origin = req.headers.origin || req.headers.referer || '';
+        
+        // Default to live URL
+        let baseUrl = process.env.BASE_URL_LIVE || 'https://megatools-dashboard-test.netlify.app';
+        
+        // If request is from localhost, use local URL
+        if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+            baseUrl = process.env.BASE_URL_LOCAL || 'http://localhost:3000';
         }
-
-        const baseUrl = process.env.BASE_URL;
+        
+        // Clean the base URL (remove trailing slash if any)
+        baseUrl = baseUrl.replace(/\/$/, '');
+        
         const link = `${baseUrl}/?ref=${req.user.referralCode}`;
-
+        
+        // Determine what roles this user can invite
+        let canInvite = [];
+        if (req.user.role === 'admin') {
+            canInvite = ['moderator'];
+        } else if (req.user.role === 'moderator') {
+            canInvite = ['user'];
+        }
+        
         res.json({ 
+            success: true,
             referralCode: req.user.referralCode,
             link,
-            canInvite: inviteRoles,
-            message: inviteRoles.length ? `You can invite: ${inviteRoles.join(', ')}` : 'You cannot invite anyone'
+            canInvite,
+            message: canInvite.length ? `You can invite: ${canInvite.join(', ')}` : 'You cannot invite anyone',
+            baseUrl: baseUrl // For debugging
         });
 
     } catch (error) {
@@ -1108,9 +1125,6 @@ app.delete('/api/campaigns/:id', authMiddleware, roleMiddleware('admin'), async 
             return res.status(404).json({ message: 'Campaign not found' });
         }
 
-        // Also delete associated clicks? Optional
-        // await Click.deleteMany({ campaignId: campaign._id });
-
         console.log(`🗑️ Campaign deleted: ${campaign.name} by ${req.user.email}`);
 
         res.json({ 
@@ -1197,7 +1211,7 @@ app.put('/api/sessions/:id', authMiddleware, async (req, res) => {
     }
 });
 
-// Delete session (move to trash or hard delete)
+// Delete session
 app.delete('/api/sessions/:id', authMiddleware, async (req, res) => {
     try {
         const session = await Session.findOneAndDelete({
@@ -1222,7 +1236,7 @@ app.delete('/api/sessions/:id', authMiddleware, async (req, res) => {
 
 // ==================== TRACKING ROUTES ====================
 
-// Track click (public endpoint - no auth required)
+// Track click (public endpoint)
 app.post('/api/track', async (req, res) => {
     try {
         const { campaignId, device, browser, country, city, ipAddress, userAgent, referrer, language, screenSize, sessionId, metadata } = req.body;
@@ -1409,7 +1423,7 @@ app.get('/api/dashboard/stats', authMiddleware, async (req, res) => {
         const activeSessions = await Session.countDocuments({ 
             ownerMasterId: req.user.masterId,
             is_online: true,
-            updated_at: { $gte: new Date(Date.now() - 5 * 60 * 1000) } // last 5 minutes
+            updated_at: { $gte: new Date(Date.now() - 5 * 60 * 1000) }
         });
 
         const totalSessions = await Session.countDocuments({ 
@@ -1524,7 +1538,7 @@ async function createDefaultAdmin() {
     }
 }
 
-// Create some default campaigns if none exist
+// Create default campaigns
 async function createDefaultCampaigns() {
     try {
         const admin = await User.findOne({ role: 'admin' });
